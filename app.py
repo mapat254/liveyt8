@@ -962,7 +962,7 @@ def show_video_merger():
         if not output_name.endswith('.mp4'):
             output_name += '.mp4'
         
-        # Use the videos directory
+        output_path = os.path.join("/mount/src/liveyt8", output_name)
         videos_dir = "./videos"
         output_path = os.path.join(videos_dir, output_name)
         
