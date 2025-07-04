@@ -483,6 +483,10 @@ def stop_streaming():
 
 def get_video_files(directory="/mount/src/liveyt9"):
     """Get list of video files"""
+    # Use the correct directory path
+    if not os.path.exists(directory):
+        directory = "/mount/src/liveyt8"  # Fallback to correct directory
+    
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.webm', '.m4v']
     video_files = []
     
@@ -786,7 +790,19 @@ def show_file_manager():
     """File Manager Interface"""
     st.header("📁 File Manager")
     
-    current_dir = "/mount/src/liveyt9"
+    # Use the correct current directory
+    current_dir = "/mount/src/liveyt8"
+    
+    # Ensure directory exists
+    if not os.path.exists(current_dir):
+        try:
+            os.makedirs(current_dir, exist_ok=True)
+            log_message('INFO', f"Created directory: {current_dir}")
+        except Exception as e:
+            st.error(f"Failed to create directory: {e}")
+            log_message('ERROR', f"Failed to create directory {current_dir}: {e}")
+            return
+    
     st.subheader(f"📂 Current Directory: {current_dir}")
     
     # File upload
@@ -800,10 +816,19 @@ def show_file_manager():
         for uploaded_file in uploaded_files:
             file_path = os.path.join(current_dir, uploaded_file.name)
             try:
+                # Check if file already exists
+                if os.path.exists(file_path):
+                    st.warning(f"⚠️ File {uploaded_file.name} already exists. Overwriting...")
+                
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 st.success(f"✅ Uploaded: {uploaded_file.name}")
                 log_message('INFO', f"File uploaded: {uploaded_file.name}")
+                
+                # Refresh the page to show the new file
+                time.sleep(1)
+                st.rerun()
+                
             except Exception as e:
                 st.error(f"❌ Failed to upload {uploaded_file.name}: {e}")
                 log_message('ERROR', f"File upload failed: {uploaded_file.name} - {e}")
@@ -914,7 +939,7 @@ def show_video_merger():
         if not output_name.endswith('.mp4'):
             output_name += '.mp4'
         
-        output_path = os.path.join("/mount/src/liveyt9", output_name)
+        output_path = os.path.join("/mount/src/liveyt8", output_name)
         
         with st.spinner("Merging videos... This may take a while."):
             success, message = merge_videos(selected_videos, output_path, merge_method, output_resolution)
@@ -1093,6 +1118,8 @@ def show_settings():
     
     with col2:
         current_dir = "/mount/src/liveyt9"
+        # Use correct directory
+        current_dir = "/mount/src/liveyt8"
         st.info(f"**Current Directory:** {current_dir}")
         
         # Count stream history
@@ -1162,6 +1189,10 @@ def show_settings():
                     cursor.execute('DELETE FROM stream_history')
                     cursor.execute('DELETE FROM stream_logs')
                     conn.commit()
+                
+                # Clear session state logs too
+                st.session_state.stream_logs = []
+                
                 st.success("Stream history cleared!")
                 log_message('INFO', "Stream history cleared by user")
             except Exception as e:
@@ -1178,6 +1209,11 @@ def show_settings():
                     cursor.execute('DROP TABLE IF EXISTS stream_logs')
                     conn.commit()
                 init_database()
+                
+                # Clear session state
+                st.session_state.stream_logs = []
+                st.session_state.current_session_id = str(uuid.uuid4())
+                
                 st.success("Database reset successfully!")
                 log_message('INFO', "Database reset by user")
             except Exception as e:
