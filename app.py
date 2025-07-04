@@ -11,68 +11,101 @@ import uuid
 import logging
 import queue
 import re
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Database connection pool and thread safety
+@contextmanager
+def get_db_connection():
+    """Thread-safe database connection with proper error handling"""
+    conn = None
+    try:
+        conn = sqlite3.connect('streaming_app.db', timeout=30.0, check_same_thread=False)
+        conn.execute('PRAGMA journal_mode=WAL')  # Enable WAL mode for better concurrency
+        conn.execute('PRAGMA synchronous=NORMAL')  # Balance between safety and performance
+        conn.execute('PRAGMA temp_store=memory')  # Use memory for temporary storage
+        conn.execute('PRAGMA cache_size=10000')  # Increase cache size
+        yield conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
 # Database setup
 def init_database():
-    conn = sqlite3.connect('streaming_app.db')
-    cursor = conn.cursor()
-    
-    # Create tables
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stream_configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            stream_key TEXT NOT NULL,
-            video_file TEXT NOT NULL,
-            resolution TEXT NOT NULL,
-            bitrate INTEGER NOT NULL,
-            audio_bitrate INTEGER NOT NULL,
-            encoding_preset TEXT NOT NULL,
-            shorts_mode BOOLEAN NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stream_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            video_file TEXT NOT NULL,
-            resolution TEXT NOT NULL,
-            bitrate INTEGER NOT NULL,
-            start_time TIMESTAMP NOT NULL,
-            end_time TIMESTAMP,
-            duration INTEGER,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stream_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            level TEXT NOT NULL,
-            message TEXT NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    """Initialize database with proper schema and constraints"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Create tables with proper constraints
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stream_configs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    stream_key TEXT NOT NULL,
+                    video_file TEXT NOT NULL,
+                    resolution TEXT NOT NULL,
+                    bitrate INTEGER NOT NULL,
+                    audio_bitrate INTEGER NOT NULL,
+                    encoding_preset TEXT NOT NULL,
+                    shorts_mode BOOLEAN NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stream_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    video_file TEXT NOT NULL,
+                    resolution TEXT NOT NULL,
+                    bitrate INTEGER NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT,
+                    duration INTEGER,
+                    status TEXT NOT NULL DEFAULT 'STARTING',
+                    error_message TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stream_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL DEFAULT 'system',
+                    level TEXT NOT NULL DEFAULT 'INFO',
+                    message TEXT NOT NULL,
+                    timestamp TEXT DEFAULT (datetime('now'))
+                )
+            ''')
+            
+            # Create indexes for better performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_stream_history_session ON stream_history(session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_stream_logs_session ON stream_logs(session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_stream_logs_timestamp ON stream_logs(timestamp)')
+            
+            conn.commit()
+            logger.info("Database initialized successfully")
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
 
 # Initialize database
 init_database()
@@ -85,37 +118,76 @@ if 'streaming_active' not in st.session_state:
 if 'stream_stats' not in st.session_state:
     st.session_state.stream_stats = {}
 if 'current_session_id' not in st.session_state:
-    st.session_state.current_session_id = None
+    st.session_state.current_session_id = str(uuid.uuid4())
 if 'log_queue' not in st.session_state:
     st.session_state.log_queue = queue.Queue()
 if 'stream_logs' not in st.session_state:
     st.session_state.stream_logs = []
 
 def log_message(level, message, session_id=None):
-    """Add log message to queue and database"""
-    timestamp = datetime.now()
-    log_entry = {
-        'timestamp': timestamp,
-        'level': level,
-        'message': message,
-        'session_id': session_id or st.session_state.get('current_session_id', 'system')
-    }
-    
-    # Add to session state
-    st.session_state.stream_logs.append(log_entry)
-    
-    # Add to database
+    """Add log message to queue and database with proper error handling"""
     try:
-        conn = sqlite3.connect('streaming_app.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO stream_logs (session_id, level, message, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (log_entry['session_id'], level, message, timestamp))
-        conn.commit()
-        conn.close()
+        # Ensure we have a valid session_id
+        if not session_id:
+            session_id = st.session_state.get('current_session_id', 'system')
+        
+        # Ensure session_id is not None or empty
+        if not session_id or session_id.strip() == '':
+            session_id = 'system'
+        
+        timestamp = datetime.now().isoformat()
+        log_entry = {
+            'timestamp': datetime.now(),
+            'level': level,
+            'message': message,
+            'session_id': session_id
+        }
+        
+        # Add to session state (limit to last 1000 entries)
+        st.session_state.stream_logs.append(log_entry)
+        if len(st.session_state.stream_logs) > 1000:
+            st.session_state.stream_logs = st.session_state.stream_logs[-1000:]
+        
+        # Add to database with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO stream_logs (session_id, level, message, timestamp)
+                        VALUES (?, ?, ?, ?)
+                    ''', (session_id, level, message, timestamp))
+                    conn.commit()
+                break  # Success, exit retry loop
+                
+            except sqlite3.IntegrityError as e:
+                logger.error(f"Database integrity error (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    # Last attempt failed, log to console only
+                    print(f"[{timestamp}] {level}: {message}")
+                else:
+                    time.sleep(0.1)  # Brief delay before retry
+                    
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    logger.warning(f"Database locked (attempt {attempt + 1}), retrying...")
+                    if attempt == max_retries - 1:
+                        print(f"[{timestamp}] {level}: {message}")
+                    else:
+                        time.sleep(0.2)  # Wait longer for lock to release
+                else:
+                    logger.error(f"Database operational error: {e}")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Unexpected database error: {e}")
+                break
+                
     except Exception as e:
-        logger.error(f"Failed to save log to database: {e}")
+        # Fallback: log to console if all else fails
+        print(f"[{datetime.now().isoformat()}] {level}: {message}")
+        print(f"Log error: {e}")
 
 def check_ffmpeg():
     """Check if FFmpeg is available"""
@@ -334,15 +406,17 @@ def start_streaming(video_file, stream_key, resolution, bitrate, audio_bitrate, 
         )
         monitor_thread.start()
         
-        # Save to history
-        conn = sqlite3.connect('streaming_app.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO stream_history (session_id, video_file, resolution, bitrate, start_time, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (session_id, video_file, resolution, bitrate, datetime.now(), 'STREAMING'))
-        conn.commit()
-        conn.close()
+        # Save to history with proper error handling
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO stream_history (session_id, video_file, resolution, bitrate, start_time, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (session_id, video_file, resolution, bitrate, datetime.now().isoformat(), 'STREAMING'))
+                conn.commit()
+        except Exception as db_error:
+            log_message('WARNING', f"Failed to save stream history: {db_error}", session_id)
         
         log_message('INFO', "Streaming started successfully", session_id)
         return True, "Streaming started successfully"
@@ -378,20 +452,20 @@ def stop_streaming():
                 st.session_state.streaming_process.kill()
                 st.session_state.streaming_process.wait()
             
-            # Update history
+            # Update history with proper error handling
             if session_id:
-                conn = sqlite3.connect('streaming_app.db')
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE stream_history 
-                    SET end_time = ?, status = ?, duration = (
-                        SELECT (julianday(?) - julianday(start_time)) * 24 * 60 * 60
-                        FROM stream_history WHERE session_id = ?
-                    )
-                    WHERE session_id = ? AND end_time IS NULL
-                ''', (datetime.now(), 'STOPPED', datetime.now(), session_id, session_id))
-                conn.commit()
-                conn.close()
+                try:
+                    with get_db_connection() as conn:
+                        cursor = conn.cursor()
+                        end_time = datetime.now().isoformat()
+                        cursor.execute('''
+                            UPDATE stream_history 
+                            SET end_time = ?, status = ?
+                            WHERE session_id = ? AND end_time IS NULL
+                        ''', (end_time, 'STOPPED', session_id))
+                        conn.commit()
+                except Exception as db_error:
+                    log_message('WARNING', f"Failed to update stream history: {db_error}", session_id)
             
             st.session_state.streaming_process = None
             st.session_state.streaming_active = False
@@ -435,16 +509,15 @@ def get_video_files(directory="/mount/src/liveyt9"):
 def save_configuration(name, config):
     """Save streaming configuration"""
     try:
-        conn = sqlite3.connect('streaming_app.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO stream_configs 
-            (name, stream_key, video_file, resolution, bitrate, audio_bitrate, encoding_preset, shorts_mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (name, config['stream_key'], config['video_file'], config['resolution'], 
-              config['bitrate'], config['audio_bitrate'], config['encoding_preset'], config['shorts_mode']))
-        conn.commit()
-        conn.close()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO stream_configs 
+                (name, stream_key, video_file, resolution, bitrate, audio_bitrate, encoding_preset, shorts_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (name, config['stream_key'], config['video_file'], config['resolution'], 
+                  config['bitrate'], config['audio_bitrate'], config['encoding_preset'], config['shorts_mode']))
+            conn.commit()
         return True
     except Exception as e:
         log_message('ERROR', f"Failed to save configuration: {e}")
@@ -453,11 +526,11 @@ def save_configuration(name, config):
 def load_configurations():
     """Load saved configurations"""
     try:
-        conn = sqlite3.connect('streaming_app.db')
-        df = pd.read_sql_query('SELECT * FROM stream_configs ORDER BY created_at DESC', conn)
-        conn.close()
+        with get_db_connection() as conn:
+            df = pd.read_sql_query('SELECT * FROM stream_configs ORDER BY created_at DESC', conn)
         return df
-    except:
+    except Exception as e:
+        log_message('ERROR', f"Failed to load configurations: {e}")
         return pd.DataFrame()
 
 def show_stream_control():
@@ -943,13 +1016,12 @@ def show_analytics():
     st.header("📈 Analytics Dashboard")
     
     try:
-        conn = sqlite3.connect('streaming_app.db')
-        
-        # Stream history
-        history_df = pd.read_sql_query('''
-            SELECT * FROM stream_history 
-            ORDER BY start_time DESC
-        ''', conn)
+        with get_db_connection() as conn:
+            # Stream history
+            history_df = pd.read_sql_query('''
+                SELECT * FROM stream_history 
+                ORDER BY start_time DESC
+            ''', conn)
         
         if not history_df.empty:
             # Summary metrics
@@ -977,7 +1049,6 @@ def show_analytics():
             # Recent streams table
             st.subheader("📋 Recent Streams")
             display_df = history_df.copy()
-            display_df['start_time'] = pd.to_datetime(display_df['start_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
             display_df['video_file'] = display_df['video_file'].apply(lambda x: os.path.basename(x) if pd.notna(x) else '')
             display_df['duration_formatted'] = display_df['duration'].apply(
                 lambda x: f"{int(x//60)}:{int(x%60):02d}" if pd.notna(x) else "N/A"
@@ -999,10 +1070,9 @@ def show_analytics():
         else:
             st.info("No streaming history available yet. Start streaming to see analytics!")
         
-        conn.close()
-        
     except Exception as e:
         st.error(f"Error loading analytics: {e}")
+        log_message('ERROR', f"Analytics error: {e}")
 
 def show_settings():
     """Settings Interface"""
@@ -1027,11 +1097,10 @@ def show_settings():
         
         # Count stream history
         try:
-            conn = sqlite3.connect('streaming_app.db')
-            cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) FROM stream_history')
-            history_count = cursor.fetchone()[0]
-            conn.close()
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM stream_history')
+                history_count = cursor.fetchone()[0]
             st.info(f"**Stream History Records:** {history_count}")
         except:
             st.info("**Stream History Records:** 0")
@@ -1088,12 +1157,11 @@ def show_settings():
     with col1:
         if st.button("🗑️ Clear Stream History"):
             try:
-                conn = sqlite3.connect('streaming_app.db')
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM stream_history')
-                cursor.execute('DELETE FROM stream_logs')
-                conn.commit()
-                conn.close()
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM stream_history')
+                    cursor.execute('DELETE FROM stream_logs')
+                    conn.commit()
                 st.success("Stream history cleared!")
                 log_message('INFO', "Stream history cleared by user")
             except Exception as e:
@@ -1102,14 +1170,13 @@ def show_settings():
     with col2:
         if st.button("🔄 Reset Database"):
             try:
-                conn = sqlite3.connect('streaming_app.db')
-                cursor = conn.cursor()
-                cursor.execute('DROP TABLE IF EXISTS stream_configs')
-                cursor.execute('DROP TABLE IF EXISTS stream_history')
-                cursor.execute('DROP TABLE IF EXISTS app_settings')
-                cursor.execute('DROP TABLE IF EXISTS stream_logs')
-                conn.commit()
-                conn.close()
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DROP TABLE IF EXISTS stream_configs')
+                    cursor.execute('DROP TABLE IF EXISTS stream_history')
+                    cursor.execute('DROP TABLE IF EXISTS app_settings')
+                    cursor.execute('DROP TABLE IF EXISTS stream_logs')
+                    conn.commit()
                 init_database()
                 st.success("Database reset successfully!")
                 log_message('INFO', "Database reset by user")
