@@ -198,4 +198,4 @@ For issues and feature requests:
 
 ---
 
-Built with ❤️ using Streamlit and FFmpeg
+made nididchy with ❤️ using Streamlit and FFmpeg
