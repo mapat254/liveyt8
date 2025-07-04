@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 import pandas as pd
 from pathlib import Path
+import queue
+import signal
 
 # Install required packages
 try:
@@ -57,6 +59,15 @@ class StreamingDatabase:
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stream_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                message TEXT,
+                log_type TEXT DEFAULT 'INFO'
             )
         ''')
         
@@ -129,134 +140,150 @@ class StreamingDatabase:
         result = cursor.fetchone()
         conn.close()
         return result[0] if result else default
+    
+    def save_log(self, message, log_type='INFO'):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO stream_logs (message, log_type)
+            VALUES (?, ?)
+        ''', (message, log_type))
+        conn.commit()
+        conn.close()
+    
+    def get_logs(self, limit=100):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT timestamp, message, log_type FROM stream_logs 
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (limit,))
+        logs = cursor.fetchall()
+        conn.close()
+        return logs
+    
+    def clear_logs(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM stream_logs')
+        conn.commit()
+        conn.close()
 
-class AdvancedStreamer:
-    def __init__(self):
-        self.db = StreamingDatabase()
-        self.init_session_state()
+class StreamingProcess:
+    def __init__(self, db):
+        self.db = db
+        self.process = None
+        self.is_running = False
+        self.stats = {
+            'frames_processed': 0,
+            'bitrate': 0,
+            'fps': 0,
+            'size': 0
+        }
+        self.log_queue = queue.Queue()
+        self.stats_queue = queue.Queue()
     
-    def init_session_state(self):
-        # Initialize session state with persistent data
-        if 'streaming_active' not in st.session_state:
-            st.session_state['streaming_active'] = False
-        if 'stream_start_time' not in st.session_state:
-            st.session_state['stream_start_time'] = None
-        if 'current_config' not in st.session_state:
-            st.session_state['current_config'] = None
-        if 'stream_logs' not in st.session_state:
-            st.session_state['stream_logs'] = []
-        if 'ffmpeg_process' not in st.session_state:
-            st.session_state['ffmpeg_process'] = None
-        if 'stream_stats' not in st.session_state:
-            st.session_state['stream_stats'] = {
-                'frames_processed': 0,
-                'bitrate': 0,
-                'fps': 0,
-                'size': 0
-            }
-    
-    def log_message(self, message):
+    def log_message(self, message, log_type='INFO'):
+        """Thread-safe logging"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] {message}"
-        st.session_state['stream_logs'].append(log_entry)
-        # Keep only last 100 logs to prevent memory issues
-        if len(st.session_state['stream_logs']) > 100:
-            st.session_state['stream_logs'] = st.session_state['stream_logs'][-100:]
+        self.db.save_log(log_entry, log_type)
+        self.log_queue.put(log_entry)
     
     def parse_ffmpeg_output(self, line):
-        # Parse FFmpeg output for statistics
+        """Parse FFmpeg output for statistics"""
         if "frame=" in line and "fps=" in line and "bitrate=" in line:
             try:
                 parts = line.split()
+                stats_update = {}
                 for part in parts:
                     if part.startswith("frame="):
-                        st.session_state['stream_stats']['frames_processed'] = int(part.split("=")[1])
+                        stats_update['frames_processed'] = int(part.split("=")[1])
                     elif part.startswith("fps="):
-                        st.session_state['stream_stats']['fps'] = float(part.split("=")[1])
+                        stats_update['fps'] = float(part.split("=")[1])
                     elif part.startswith("bitrate="):
                         bitrate_str = part.split("=")[1]
                         if "kbits/s" in bitrate_str:
-                            st.session_state['stream_stats']['bitrate'] = float(bitrate_str.replace("kbits/s", ""))
+                            stats_update['bitrate'] = float(bitrate_str.replace("kbits/s", ""))
                     elif part.startswith("size="):
-                        st.session_state['stream_stats']['size'] = part.split("=")[1]
-            except:
-                pass
+                        stats_update['size'] = part.split("=")[1]
+                
+                if stats_update:
+                    self.stats.update(stats_update)
+                    self.stats_queue.put(self.stats.copy())
+            except Exception as e:
+                self.log_message(f"Error parsing FFmpeg output: {e}", 'ERROR')
     
     def run_ffmpeg_stream(self, config):
-        output_url = f"rtmp://a.rtmp.youtube.com/live2/{config['stream_key']}"
-        
-        cmd = [
-            "ffmpeg", "-re", "-stream_loop", "-1", "-i", config['video_path'],
-            "-c:v", "libx264", "-preset", "veryfast", 
-            "-b:v", f"{config['bitrate']}k",
-            "-maxrate", f"{config['bitrate']}k", 
-            "-bufsize", f"{config['bitrate'] * 2}k",
-            "-g", "60", "-keyint_min", "60",
-            "-c:a", "aac", "-b:a", "128k",
-            "-f", "flv"
-        ]
-        
-        if config['is_shorts']:
-            cmd.extend(["-vf", "scale=720:1280"])
-        elif config['resolution'] != "original":
-            if config['resolution'] == "1080p":
-                cmd.extend(["-vf", "scale=1920:1080"])
-            elif config['resolution'] == "720p":
-                cmd.extend(["-vf", "scale=1280:720"])
-            elif config['resolution'] == "480p":
-                cmd.extend(["-vf", "scale=854:480"])
-        
-        cmd.append(output_url)
-        
-        self.log_message(f"Starting stream with command: {' '.join(cmd[:5])}...")
-        
+        """Run FFmpeg streaming in separate thread"""
         try:
-            process = subprocess.Popen(
+            output_url = f"rtmp://a.rtmp.youtube.com/live2/{config['stream_key']}"
+            
+            cmd = [
+                "ffmpeg", "-re", "-stream_loop", "-1", "-i", config['video_path'],
+                "-c:v", "libx264", "-preset", "veryfast", 
+                "-b:v", f"{config['bitrate']}k",
+                "-maxrate", f"{config['bitrate']}k", 
+                "-bufsize", f"{config['bitrate'] * 2}k",
+                "-g", "60", "-keyint_min", "60",
+                "-c:a", "aac", "-b:a", "128k",
+                "-f", "flv"
+            ]
+            
+            if config['is_shorts']:
+                cmd.extend(["-vf", "scale=720:1280"])
+            elif config['resolution'] != "original":
+                if config['resolution'] == "1080p":
+                    cmd.extend(["-vf", "scale=1920:1080"])
+                elif config['resolution'] == "720p":
+                    cmd.extend(["-vf", "scale=1280:720"])
+                elif config['resolution'] == "480p":
+                    cmd.extend(["-vf", "scale=854:480"])
+            
+            cmd.append(output_url)
+            
+            self.log_message(f"Starting stream: {config.get('name', 'Manual Stream')}")
+            self.log_message(f"Video: {config['video_path']}")
+            self.log_message(f"Resolution: {config['resolution']}")
+            self.log_message(f"Bitrate: {config['bitrate']}k")
+            
+            self.process = subprocess.Popen(
                 cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
                 text=True,
-                universal_newlines=True
+                universal_newlines=True,
+                preexec_fn=os.setsid if os.name != 'nt' else None
             )
-            st.session_state['ffmpeg_process'] = process
             
-            for line in process.stdout:
-                if not st.session_state['streaming_active']:
-                    process.terminate()
+            self.is_running = True
+            
+            # Read FFmpeg output
+            for line in self.process.stdout:
+                if not self.is_running:
                     break
                 
-                self.parse_ffmpeg_output(line)
                 if line.strip():
-                    self.log_message(line.strip())
+                    self.parse_ffmpeg_output(line)
+                    if "error" in line.lower() or "failed" in line.lower():
+                        self.log_message(line.strip(), 'ERROR')
+                    else:
+                        self.log_message(line.strip(), 'DEBUG')
             
-            process.wait()
+            self.process.wait()
             
         except Exception as e:
-            self.log_message(f"Error during streaming: {str(e)}")
+            self.log_message(f"Streaming error: {str(e)}", 'ERROR')
         finally:
-            st.session_state['streaming_active'] = False
-            if st.session_state['stream_start_time']:
-                end_time = datetime.now()
-                self.db.save_stream_history(
-                    config.get('name', 'Unknown'),
-                    st.session_state['stream_start_time'],
-                    end_time,
-                    'Completed',
-                    config['video_path'],
-                    config['stream_key']
-                )
-            self.log_message("Streaming ended")
+            self.is_running = False
+            self.log_message("Streaming process ended")
     
-    def start_streaming(self, config):
-        if st.session_state['streaming_active']:
-            st.error("Streaming sudah berjalan!")
-            return
+    def start_stream(self, config):
+        """Start streaming process"""
+        if self.is_running:
+            return False, "Stream already running"
         
-        st.session_state['streaming_active'] = True
-        st.session_state['stream_start_time'] = datetime.now()
-        st.session_state['current_config'] = config
-        
-        # Start streaming in a separate thread
+        # Start streaming thread
         thread = threading.Thread(
             target=self.run_ffmpeg_stream, 
             args=(config,), 
@@ -264,25 +291,132 @@ class AdvancedStreamer:
         )
         thread.start()
         
-        self.log_message("Streaming started successfully!")
+        return True, "Stream started successfully"
+    
+    def stop_stream(self):
+        """Stop streaming process"""
+        if not self.is_running:
+            return False, "No stream running"
+        
+        self.is_running = False
+        
+        try:
+            if self.process:
+                if os.name == 'nt':  # Windows
+                    self.process.terminate()
+                else:  # Unix/Linux
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                
+                # Wait for process to terminate
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name == 'nt':
+                        self.process.kill()
+                    else:
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+        except Exception as e:
+            self.log_message(f"Error stopping stream: {e}", 'ERROR')
+        
+        self.log_message("Stream stopped by user")
+        return True, "Stream stopped successfully"
+    
+    def get_stats(self):
+        """Get current streaming statistics"""
+        return self.stats.copy()
+    
+    def get_new_logs(self):
+        """Get new log messages"""
+        logs = []
+        while not self.log_queue.empty():
+            try:
+                logs.append(self.log_queue.get_nowait())
+            except queue.Empty:
+                break
+        return logs
+    
+    def get_new_stats(self):
+        """Get new statistics"""
+        stats = None
+        while not self.stats_queue.empty():
+            try:
+                stats = self.stats_queue.get_nowait()
+            except queue.Empty:
+                break
+        return stats
+
+class AdvancedStreamer:
+    def __init__(self):
+        self.db = StreamingDatabase()
+        self.streaming_process = StreamingProcess(self.db)
+        self.init_session_state()
+    
+    def init_session_state(self):
+        """Initialize session state with persistent data"""
+        if 'streaming_active' not in st.session_state:
+            st.session_state['streaming_active'] = False
+        if 'stream_start_time' not in st.session_state:
+            st.session_state['stream_start_time'] = None
+        if 'current_config' not in st.session_state:
+            st.session_state['current_config'] = None
+        if 'stream_logs' not in st.session_state:
+            # Load recent logs from database
+            recent_logs = self.db.get_logs(50)
+            st.session_state['stream_logs'] = [f"[{log[0]}] {log[1]}" for log in recent_logs]
+        if 'stream_stats' not in st.session_state:
+            st.session_state['stream_stats'] = {
+                'frames_processed': 0,
+                'bitrate': 0,
+                'fps': 0,
+                'size': 0
+            }
+        if 'last_update' not in st.session_state:
+            st.session_state['last_update'] = time.time()
+    
+    def update_from_process(self):
+        """Update session state from streaming process"""
+        # Get new logs
+        new_logs = self.streaming_process.get_new_logs()
+        if new_logs:
+            st.session_state['stream_logs'].extend(new_logs)
+            # Keep only last 100 logs
+            if len(st.session_state['stream_logs']) > 100:
+                st.session_state['stream_logs'] = st.session_state['stream_logs'][-100:]
+        
+        # Get new stats
+        new_stats = self.streaming_process.get_new_stats()
+        if new_stats:
+            st.session_state['stream_stats'] = new_stats
+        
+        # Update streaming status
+        st.session_state['streaming_active'] = self.streaming_process.is_running
+    
+    def start_streaming(self, config):
+        """Start streaming"""
+        success, message = self.streaming_process.start_stream(config)
+        
+        if success:
+            st.session_state['streaming_active'] = True
+            st.session_state['stream_start_time'] = datetime.now()
+            st.session_state['current_config'] = config
+            
+            # Save to database
+            self.db.save_stream_history(
+                config.get('name', 'Manual Stream'),
+                st.session_state['stream_start_time'],
+                None,
+                'Started',
+                config['video_path'],
+                config['stream_key']
+            )
+        
+        return success, message
     
     def stop_streaming(self):
-        if not st.session_state['streaming_active']:
-            st.warning("Tidak ada streaming yang berjalan!")
-            return
+        """Stop streaming"""
+        success, message = self.streaming_process.stop_stream()
         
-        st.session_state['streaming_active'] = False
-        
-        # Terminate FFmpeg process
-        try:
-            if st.session_state.get('ffmpeg_process'):
-                st.session_state['ffmpeg_process'].terminate()
-            os.system("pkill -f ffmpeg")
-        except:
-            pass
-        
-        # Save to history
-        if st.session_state['stream_start_time']:
+        if success and st.session_state['stream_start_time']:
             end_time = datetime.now()
             config = st.session_state.get('current_config', {})
             self.db.save_stream_history(
@@ -293,8 +427,11 @@ class AdvancedStreamer:
                 config.get('video_path', ''),
                 config.get('stream_key', '')
             )
+            
+            st.session_state['streaming_active'] = False
+            st.session_state['stream_start_time'] = None
         
-        self.log_message("Streaming stopped by user")
+        return success, message
 
 def main():
     st.set_page_config(
@@ -304,7 +441,14 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    streamer = AdvancedStreamer()
+    # Initialize streamer
+    if 'streamer' not in st.session_state:
+        st.session_state['streamer'] = AdvancedStreamer()
+    
+    streamer = st.session_state['streamer']
+    
+    # Update from streaming process
+    streamer.update_from_process()
     
     # Custom CSS for better UI
     st.markdown("""
@@ -330,6 +474,8 @@ def main():
         padding: 0.5rem;
         border-radius: 5px;
         border: 1px solid #c3e6cb;
+        text-align: center;
+        font-weight: bold;
     }
     .status-inactive {
         background-color: #f8d7da;
@@ -337,6 +483,18 @@ def main():
         padding: 0.5rem;
         border-radius: 5px;
         border: 1px solid #f5c6cb;
+        text-align: center;
+        font-weight: bold;
+    }
+    .log-container {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 5px;
+        padding: 1rem;
+        max-height: 300px;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 12px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -366,6 +524,13 @@ def main():
                 st.write(f"⏱️ Duration: {str(duration).split('.')[0]}")
         else:
             st.markdown('<div class="status-inactive">⭕ OFFLINE</div>', unsafe_allow_html=True)
+        
+        # Auto-refresh toggle
+        auto_refresh = st.checkbox("🔄 Auto Refresh (5s)", value=True)
+        
+        if auto_refresh and st.session_state['streaming_active']:
+            time.sleep(5)
+            st.rerun()
     
     # Main content based on selected page
     if page == "🎥 Stream Control":
@@ -388,7 +553,7 @@ def show_stream_control(streamer):
         # Video selection
         st.subheader("📹 Video Selection")
         
-        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi'))]
+        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
         
         tab1, tab2 = st.tabs(["📂 Existing Videos", "⬆️ Upload New"])
         
@@ -405,8 +570,8 @@ def show_stream_control(streamer):
         with tab2:
             uploaded_file = st.file_uploader(
                 "Upload video file", 
-                type=['mp4', 'flv', 'mov', 'avi'],
-                help="Supported formats: MP4, FLV, MOV, AVI"
+                type=['mp4', 'flv', 'mov', 'avi', 'mkv', 'webm'],
+                help="Supported formats: MP4, FLV, MOV, AVI, MKV, WebM"
             )
             
             if uploaded_file:
@@ -446,7 +611,7 @@ def show_stream_control(streamer):
                 "📡 Bitrate (kbps)",
                 min_value=500,
                 max_value=8000,
-                value=2500,
+                value=int(streamer.db.get_setting('default_bitrate', 2500)),
                 step=100,
                 help="Higher bitrate = better quality but requires more bandwidth"
             )
@@ -480,10 +645,6 @@ def show_stream_control(streamer):
             st.metric("Current FPS", f"{stats['fps']:.1f}")
             st.metric("Bitrate", f"{stats['bitrate']:.1f} kbps")
             st.metric("Output Size", stats['size'])
-            
-            # Auto-refresh every 5 seconds during streaming
-            time.sleep(5)
-            st.rerun()
         else:
             st.info("🔴 Start streaming to see live statistics")
         
@@ -512,35 +673,60 @@ def show_stream_control(streamer):
                     if config_name:
                         streamer.db.save_config(config_name, config)
                     
-                    streamer.start_streaming(config)
+                    success, message = streamer.start_streaming(config)
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
                     st.rerun()
         else:
             if st.button("⏹️ Stop Streaming", type="secondary", use_container_width=True):
-                streamer.stop_streaming()
+                success, message = streamer.stop_streaming()
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
                 st.rerun()
         
         # Emergency stop
         if st.button("🚨 Emergency Stop", help="Force stop all streaming processes"):
-            os.system("pkill -9 -f ffmpeg")
-            st.session_state['streaming_active'] = False
-            st.warning("Emergency stop executed!")
+            try:
+                # Kill all ffmpeg processes
+                if os.name == 'nt':  # Windows
+                    os.system("taskkill /f /im ffmpeg.exe")
+                else:  # Unix/Linux
+                    os.system("pkill -9 -f ffmpeg")
+                
+                st.session_state['streaming_active'] = False
+                st.warning("Emergency stop executed!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Emergency stop failed: {e}")
     
     # Stream logs
     st.subheader("📋 Stream Logs")
     
     if st.session_state['stream_logs']:
-        # Show logs in a container with auto-scroll
-        log_container = st.container()
-        with log_container:
-            # Display last 20 logs
-            recent_logs = st.session_state['stream_logs'][-20:]
-            for log in recent_logs:
-                st.text(log)
+        # Show logs in a styled container
+        logs_text = "\n".join(st.session_state['stream_logs'][-30:])  # Show last 30 logs
+        st.markdown(f'<div class="log-container">{logs_text}</div>', unsafe_allow_html=True)
         
-        # Clear logs button
-        if st.button("🗑️ Clear Logs"):
-            st.session_state['stream_logs'] = []
-            st.rerun()
+        col_log1, col_log2 = st.columns(2)
+        with col_log1:
+            if st.button("🗑️ Clear Logs"):
+                st.session_state['stream_logs'] = []
+                streamer.db.clear_logs()
+                st.rerun()
+        
+        with col_log2:
+            if st.button("📥 Download Logs"):
+                logs_content = "\n".join(st.session_state['stream_logs'])
+                st.download_button(
+                    "💾 Download",
+                    data=logs_content,
+                    file_name=f"stream_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
     else:
         st.info("No logs yet. Start streaming to see logs here.")
 
@@ -595,7 +781,7 @@ def show_configurations(streamer):
             col1, col2 = st.columns(2)
             
             with col1:
-                video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi'))]
+                video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.mov', '.avi', '.mkv', '.webm'))]
                 video_path = st.selectbox("Video File*", video_files if video_files else ["No videos found"])
                 resolution = st.selectbox("Resolution", ["original", "1080p", "720p", "480p"])
             
@@ -606,7 +792,7 @@ def show_configurations(streamer):
             is_shorts = st.checkbox("YouTube Shorts Mode")
             
             if st.form_submit_button("💾 Save Configuration"):
-                if config_name and stream_key and video_path:
+                if config_name and stream_key and video_path and video_path != "No videos found":
                     config = {
                         'stream_key': stream_key,
                         'video_path': video_path,
@@ -663,7 +849,7 @@ def show_analytics(streamer):
         # Display formatted table
         display_df = df[['Config Name', 'Start Time', 'Status', 'Duration', 'Video Path']].copy()
         display_df['Duration'] = display_df['Duration'].apply(
-            lambda x: f"{x//3600}h {(x%3600)//60}m {x%60}s" if pd.notnull(x) else "N/A"
+            lambda x: f"{x//3600}h {(x%3600)//60}m {x%60}s" if pd.notnull(x) and x > 0 else "N/A"
         )
         
         st.dataframe(display_df, use_container_width=True)
@@ -803,10 +989,12 @@ def show_settings(streamer):
             # Export configurations and history
             configs = streamer.db.load_configs()
             history = streamer.db.get_stream_history(1000)
+            logs = streamer.db.get_logs(1000)
             
             export_data = {
                 'configurations': configs,
                 'history': history,
+                'logs': logs,
                 'exported_at': datetime.now().isoformat()
             }
             
@@ -823,6 +1011,7 @@ def show_settings(streamer):
                 conn = sqlite3.connect(streamer.db.db_path)
                 cursor = conn.cursor()
                 cursor.execute('DELETE FROM stream_history')
+                cursor.execute('DELETE FROM stream_logs')
                 conn.commit()
                 conn.close()
                 st.success("History cleared!")
@@ -843,26 +1032,32 @@ def show_settings(streamer):
     with col1:
         # Check FFmpeg installation
         try:
-            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 st.success("✅ FFmpeg is installed")
                 version_line = result.stdout.split('\n')[0]
                 st.info(f"Version: {version_line}")
             else:
                 st.error("❌ FFmpeg not found")
-        except:
-            st.error("❌ FFmpeg not found or not accessible")
+        except Exception as e:
+            st.error(f"❌ FFmpeg error: {e}")
     
     with col2:
         # Disk space
         try:
-            disk_usage = os.statvfs('.')
-            free_space = disk_usage.f_frsize * disk_usage.f_bavail / (1024**3)
-            total_space = disk_usage.f_frsize * disk_usage.f_blocks / (1024**3)
+            if os.name == 'nt':  # Windows
+                import shutil
+                total, used, free = shutil.disk_usage('.')
+                free_gb = free / (1024**3)
+                total_gb = total / (1024**3)
+            else:  # Unix/Linux
+                disk_usage = os.statvfs('.')
+                free_gb = disk_usage.f_frsize * disk_usage.f_bavail / (1024**3)
+                total_gb = disk_usage.f_frsize * disk_usage.f_blocks / (1024**3)
             
-            st.info(f"💾 Free Space: {free_space:.2f} GB / {total_space:.2f} GB")
-        except:
-            st.info("💾 Disk space information not available")
+            st.info(f"💾 Free Space: {free_gb:.2f} GB / {total_gb:.2f} GB")
+        except Exception as e:
+            st.info(f"💾 Disk space info unavailable: {e}")
 
 if __name__ == '__main__':
     main()
