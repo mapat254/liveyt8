@@ -923,26 +923,54 @@ def show_video_merger():
     with col1:
         merge_method = st.selectbox(
             "Merge Method",
-            ["Concatenate", "Side by Side", "Top and Bottom"],
+            ["Concatenate", "Side by Side (2 videos)", "Top and Bottom (2 videos)"],
             help="Choose how to combine the videos"
         )
+        
+        # Show method description
+        if merge_method == "Concatenate":
+            st.info("📹 Plays videos one after another in sequence")
+        elif "Side by Side" in merge_method:
+            st.info("📺 Shows 2 videos side by side (requires exactly 2 videos)")
+        elif "Top and Bottom" in merge_method:
+            st.info("📱 Shows 2 videos stacked vertically (requires exactly 2 videos)")
     
     with col2:
         output_resolution = st.selectbox(
             "Output Resolution",
-            ["Original", "1920x1080", "1280x720", "854x480"],
+            ["1280x720", "1920x1080", "854x480", "640x360"],
+            index=0,
             help="Resolution for the merged video"
         )
+        
+        # Show quality info
+        quality_info = {
+            "1280x720": "HD - Good balance of quality and file size",
+            "1920x1080": "Full HD - Best quality, larger file size",
+            "854x480": "SD - Smaller file size, lower quality",
+            "640x360": "Low - Very small file size"
+        }
+        st.info(quality_info.get(output_resolution, ""))
+    
+    # Validation for side by side and top/bottom
+    if ("Side by Side" in merge_method or "Top and Bottom" in merge_method) and len(selected_videos) != 2:
+        st.warning("⚠️ Side by Side and Top/Bottom merge methods require exactly 2 videos.")
+        return
     
     # Merge button
     if st.button("🔗 Merge Videos", type="primary"):
         if not output_name.endswith('.mp4'):
             output_name += '.mp4'
         
-        output_path = os.path.join("/mount/src/liveyt8", output_name)
+        # Use the videos directory
+        videos_dir = "./videos"
+        output_path = os.path.join(videos_dir, output_name)
+        
+        # Clean method name for processing
+        clean_method = merge_method.split(" (")[0]  # Remove the "(2 videos)" part
         
         with st.spinner("Merging videos... This may take a while."):
-            success, message = merge_videos(selected_videos, output_path, merge_method, output_resolution)
+            success, message = merge_videos(selected_videos, output_path, clean_method, output_resolution)
             
             if success:
                 st.success(f"✅ Videos merged successfully: {output_name}")
@@ -967,12 +995,17 @@ def merge_videos(video_list, output_path, method, resolution):
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', filelist_path,
-                '-c', 'copy'
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-preset', 'fast'
             ]
             
             if resolution != "Original":
                 width, height = resolution.split('x')
                 cmd.extend(['-vf', f'scale={width}:{height}'])
+            else:
+                # Even for original, we need to re-encode to ensure compatibility
+                cmd.extend(['-vf', 'scale=iw:ih'])
             
             cmd.append(output_path)
             
@@ -984,15 +1017,18 @@ def merge_videos(video_list, output_path, method, resolution):
                 'ffmpeg', '-y',
                 '-i', video_list[0]['path'],
                 '-i', video_list[1]['path'],
-                '-filter_complex', '[0:v][1:v]hstack=inputs=2[v]',
+                '-filter_complex', '[0:v]scale=640:360[v0];[1:v]scale=640:360[v1];[v0][v1]hstack=inputs=2[v]',
                 '-map', '[v]',
-                '-map', '0:a',
-                '-c:a', 'copy'
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-preset', 'fast',
+                '-ac', '2'
             ]
             
             if resolution != "Original":
                 width, height = resolution.split('x')
-                cmd.extend(['-s', f'{width}x{height}'])
+                # Resolution is handled in the filter_complex above
+                pass
             
             cmd.append(output_path)
             
@@ -1004,15 +1040,18 @@ def merge_videos(video_list, output_path, method, resolution):
                 'ffmpeg', '-y',
                 '-i', video_list[0]['path'],
                 '-i', video_list[1]['path'],
-                '-filter_complex', '[0:v][1:v]vstack=inputs=2[v]',
+                '-filter_complex', '[0:v]scale=640:360[v0];[1:v]scale=640:360[v1];[v0][v1]vstack=inputs=2[v]',
                 '-map', '[v]',
-                '-map', '0:a',
-                '-c:a', 'copy'
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-preset', 'fast',
+                '-ac', '2'
             ]
             
             if resolution != "Original":
                 width, height = resolution.split('x')
-                cmd.extend(['-s', f'{width}x{height}'])
+                # Resolution is handled in the filter_complex above
+                pass
             
             cmd.append(output_path)
         
